@@ -1,0 +1,209 @@
+name: Issue Agent Pipeline
+
+on:
+  issues:
+    types: [opened]
+
+concurrency:
+  group: issue-agent-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  engineer:
+    name: Engineer Agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      engineer_message: ${{ steps.run_engineer.outputs.final-message }}
+      pr_number: ${{ steps.create_pr.outputs.pull-request-number }}
+      pr_url: ${{ steps.create_pr.outputs.pull-request-url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run Engineer agent
+        id: run_engineer
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/agents/engineer.md
+          additional-instructions: |
+            Issue #${{ github.event.issue.number }}
+            Title: ${{ github.event.issue.title }}
+            Body:
+            ${{ github.event.issue.body }}
+          output-file: engineer-output.md
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+
+      - name: Create pull request from engineer changes
+        id: create_pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: address issue #${{ github.event.issue.number }}"
+          branch: "codex/issue-${{ github.event.issue.number }}"
+          title: "Resolve issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
+          body: |
+            Automated implementation by Engineer agent for #${{ github.event.issue.number }}.
+
+            ### Engineer output
+            ${{ steps.run_engineer.outputs.final-message }}
+          labels: automated,codex
+          add-paths: |
+            **
+
+      - name: Comment engineer result on issue
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const prUrl = `${{ steps.create_pr.outputs.pull-request-url }}`;
+            const finalMessage = `${{ steps.run_engineer.outputs.final-message }}`;
+            const body = [
+              "## Engineer agent complete",
+              prUrl ? `PR created: ${prUrl}` : "No PR created (no file changes detected).",
+              "",
+              "### Engineer summary",
+              finalMessage || "No summary produced."
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+  qa:
+    name: QA Agent
+    runs-on: ubuntu-latest
+    needs: engineer
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    outputs:
+      qa_message: ${{ steps.run_qa.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run QA agent
+        id: run_qa
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/agents/qa.md
+          additional-instructions: |
+            Issue #${{ github.event.issue.number }}
+            Title: ${{ github.event.issue.title }}
+            Body:
+            ${{ github.event.issue.body }}
+
+            Pull request number: ${{ needs.engineer.outputs.pr_number }}
+            Pull request URL: ${{ needs.engineer.outputs.pr_url }}
+          output-file: qa-output.md
+          sandbox: read-only
+          safety-strategy: drop-sudo
+
+      - name: Post QA review
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const qa = `${{ steps.run_qa.outputs.final-message }}`;
+            const prNumberRaw = `${{ needs.engineer.outputs.pr_number }}`;
+            const prNumber = Number(prNumberRaw);
+
+            const issueBody = [
+              "## QA agent complete",
+              "",
+              qa || "No QA output produced."
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: issueBody,
+            });
+
+            if (Number.isFinite(prNumber) && prNumber > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: issueBody,
+              });
+            }
+
+  pm:
+    name: PM Agent
+    runs-on: ubuntu-latest
+    needs: [engineer, qa]
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run PM agent
+        id: run_pm
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/agents/pm.md
+          additional-instructions: |
+            Issue #${{ github.event.issue.number }}
+            Title: ${{ github.event.issue.title }}
+            Body:
+            ${{ github.event.issue.body }}
+
+            Pull request number: ${{ needs.engineer.outputs.pr_number }}
+            Pull request URL: ${{ needs.engineer.outputs.pr_url }}
+
+            Engineer summary:
+            ${{ needs.engineer.outputs.engineer_message }}
+
+            QA summary:
+            ${{ needs.qa.outputs.qa_message }}
+          output-file: pm-output.md
+          sandbox: read-only
+          safety-strategy: drop-sudo
+
+      - name: Post PM summary to issue and PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const pm = `${{ steps.run_pm.outputs.final-message }}`;
+            const prNumberRaw = `${{ needs.engineer.outputs.pr_number }}`;
+            const prNumber = Number(prNumberRaw);
+
+            const body = [
+              "## PM agent summary",
+              "",
+              pm || "No PM output produced."
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+            if (Number.isFinite(prNumber) && prNumber > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
